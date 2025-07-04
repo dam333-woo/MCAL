@@ -1,0 +1,206 @@
+import os
+import shutil
+from operator import concat
+from pydoc import classname
+
+from fvcore.nn import FlopCountAnalysis
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+
+from utils import sdm_loss_function, cds_loss_function
+import clip
+import model
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
+from torch import nn, optim
+from torch.nn import TripletMarginWithDistanceLoss, CrossEntropyLoss
+from torch.optim import Adam
+from torch.utils.data.dataloader import DataLoader
+from tqdm import tqdm
+from utils import TensorQueue
+from model import load_clip_to_cpu, CustomCLIP
+from utils import DomainDataset, compute_metric, custom_triplet_loss
+from option import parse_args
+
+
+# train for one epoch
+def train(model, data_loader, train_optimizer):
+    model.train()
+    total_loss, total_num, train_bar = 0.0, 0, tqdm(data_loader, dynamic_ncols=True)
+    for sk, pos, neg, label, neg_label in train_bar:
+        sk = sk.cuda(args.device)
+        pos = pos.cuda(args.device)
+        neg = neg.cuda(args.device)
+        label = label.cuda(args.device)
+        neg_label = neg_label.cuda(args.device)
+        text_features, sketch_features, pos_features, neg_features = model(sk, pos, neg)
+
+
+
+        if args.v_ref_weight > 0:
+            
+            photo = torch.cat([pos, neg], dim=0)
+            
+            zs_p_features = model.visual_encoder([photo, None])
+            zs_s_features = model.visual_encoder([sk, None])
+            mma_p_features = torch.cat([pos_features, neg_features], dim=0)
+            mma_s_features = sketch_features
+            p_sym_label = torch.arange(pos.shape[0] + neg.shape[0]).to(args.device)
+            s_sym_label = torch.arange(sk.shape[0]).to(args.device)
+            
+            
+            # visual ref loss
+            logits_p = mma_p_features @ zs_p_features.type_as(mma_p_features).t()
+            logits_s = mma_s_features @ zs_s_features.type_as(mma_s_features).t()
+            visual_ref_loss = F.cross_entropy(logits_p, p_sym_label) + F.cross_entropy(logits_s, s_sym_label)
+           
+        else:
+            visual_ref_loss = 0
+        
+
+
+
+
+        # triplet_loss
+        triplet_loss = triplet_criterion(sketch_features, pos_features, neg_features)
+        # KL loss
+        cds_logit_scale = torch.ones([]) * (1 / args.TEMPERATURE)
+
+        # 保存的特征需要detach()，不然会造成第二次传播报错
+        s_cds = cds_loss_function(sketch_features, torch.cat([pos_features, neg_features], dim=0), label,
+                                  torch.cat([label, neg_label], dim=0),cds_logit_scale)
+
+        # cosine similarity as logits
+        logit_scale = clip_model.logit_scale
+        logits_sketch = logit_scale * sketch_features @ text_features.t()
+        logits_pos = logit_scale * pos_features @ text_features.t()
+        logits_neg = logit_scale * neg_features @ text_features.t()
+        cls_sketch_loss = cls_criterion(logits_sketch, label)
+        cls_photo_loss = cls_criterion(logits_pos, label)
+
+
+        # total loss
+        loss = triplet_loss + (cls_sketch_loss + cls_photo_loss) * args.cls_weight + visual_ref_loss * args.v_ref_weight + s_cds * args.KL_weight
+        train_optimizer.zero_grad()
+        loss.backward()
+        train_optimizer.step()
+        scheduler.step()
+        total_num += sk.size(0)
+        total_loss += loss.item() * sk.size(0)
+        train_bar.set_description('Train Epoch: [{}/{}] Loss: {:.4f}'
+                                 .format(epoch, args.epochs, total_loss / total_num))
+
+    return total_loss / total_num
+
+
+# val for one epoch
+def val(model, data_loader):
+
+    model.eval()
+    vectors, domains, labels = [], [], []
+    with torch.no_grad():
+        for img, domain, label in tqdm(data_loader, desc='Feature extracting', dynamic_ncols=True):
+            # domain = 0 -> photo , domain = 1 -> sketch
+            img = img.cuda(args.device)
+            domain = domain.cuda(args.device)
+            label = label.cuda(args.device)
+
+            if domain == 0:
+                emb = model.encode_photo(img, model.adapter_learner.photo_adapter_func)
+            else:
+                emb = model.encode_sketch(img, model.adapter_learner.sketch_adapter_func)
+            vectors.append(emb)
+            domains.append(domain)
+            labels.append(label)
+
+        vectors = torch.cat(vectors, dim=0)
+        domains = torch.cat(domains, dim=0)
+        labels = torch.cat(labels, dim=0)
+        acc = compute_metric(vectors, domains, labels)
+        results['P@100'].append(acc['P@100'] * 100)
+        results['P@200'].append(acc['P@200'] * 100)
+        results['mAP@200'].append(acc['mAP@200'] * 100)
+        results['mAP@all'].append(acc['mAP@all'] * 100)
+        print('Val Epoch: [{}/{}] | P@100:{:.1f}% | P@200:{:.1f}% | mAP@200:{:.1f}% | mAP@all:{:.1f}%'
+              .format(epoch, args.epochs, acc['P@100'] * 100, acc['P@200'] * 100, acc['mAP@200'] * 100,
+                      acc['mAP@all'] * 100))
+    return acc['precise'], vectors
+
+# 使用ref
+if __name__ == '__main__':
+    # args parse
+
+    args = parse_args()
+    save_name_pre = '{}'.format(args.data_name)
+    val_data = DomainDataset(args.data_root, args.data_name, split='val')
+    print(f'using dataset:{args.data_name}')
+    if args.mode == 'train':
+        # data prepare
+        train_data = DomainDataset(args.data_root, args.data_name, split='train')
+        train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=16)
+        val_loader = DataLoader(val_data, batch_size=1, shuffle=False, num_workers=16)
+        classnames = train_data.names.values()
+        # 三元组损失
+        triplet_criterion = TripletMarginWithDistanceLoss(
+            distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y),
+            margin=args.triplet_margin)
+        # 分类判别损失， 交叉熵
+        cls_criterion = CrossEntropyLoss()
+        # clip model setup
+        print(f"Loading CLIP (backbone: {args.backbone})")
+        clip_model = load_clip_to_cpu(args)
+        if args.PREC == "fp32" or args.PREC == "amp":
+            # CLIP's default precision is fp16
+            clip_model.float()
+        # mma model
+        model = CustomCLIP(args, classnames, clip_model)
+
+        for name, param in model.named_parameters():
+            if "text_adapter" not in name and "photo_adapter" not in name  and "sketch_adapter" not in name and "shared_adapter" not in name:
+                param.requires_grad_(False)
+
+
+        # Double check
+        num_trainable_params = 0
+        enabled = set()
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+                num_trainable_params += param.data.nelement()
+        print(f"Parameters to be updated: {enabled}")
+        print(f"Number of trainable parameters: {num_trainable_params}")
+        model.cuda(args.device)
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"总参数量: {total_params:,}")
+        print(f"可学习参数量: {trainable_params:,}")
+        optimizer = optim.SGD([
+            {'params': model.adapter_learner.parameters(), 'lr': args.encoder_lr},
+        ], momentum=0.9, weight_decay=0.0005)
+        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        """
+        optimizer = Adam([{'params': model.adapter_learner.text_adapter.parameters(), 'lr': args.encoder_lr},
+                          {'params': model.adapter_learner.photo_adapter.parameters(), 'lr': args.encoder_lr},
+                          {'params': model.adapter_learner.sketch_adapter.parameters(), 'lr': args.encoder_lr},
+                          {'params': model.adapter_learner.shared_adapter.parameters(), 'lr': args.shared_lr}],weight_decay=5e-4)"""
+        # training loop
+        results = {'train_loss': [], 'P@100': [], 'P@200': [], 'mAP@200': [], 'mAP@all': []}
+        best_precise = 0.0
+        for epoch in range(1, args.epochs + 1):
+            # train
+
+            train_loss = train(model, train_loader, optimizer)
+            results['train_loss'].append(train_loss)
+
+            val_precise, features = val(model, val_loader)
+            #save statistics
+            data_frame = pd.DataFrame(data=results, index=range(1, epoch + 1))
+            data_frame.to_csv('{}/{}_results.csv'.format(args.save_root, save_name_pre), index_label='epoch')
+            #save best model
+            if val_precise > best_precise:
+                best_precise = val_precise
+                torch.save(model.state_dict(), '{}/{}_model.pth'.format(args.save_root, save_name_pre))
+                torch.save(features.cpu(), '{}/{}_vectors.pth'.format(args.save_root, save_name_pre))
